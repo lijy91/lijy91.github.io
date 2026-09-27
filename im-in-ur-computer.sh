@@ -9,32 +9,32 @@
 
 KEYWORD="LiJianying"
 ICASE=0
-VERBOSE=0
+LIST=0
 ONLY_DIRS=""
 
-# Help is inlined (not read from $0) so it works with `curl | sh`
+# Help is inlined (not read from $0) so it works with `curl | sh`,
+# and is a plain string (some shells back heredocs with temp files)
 usage() {
-  cat <<'USAGE'
-im in ur computer 👀
-Find apps on your machine that ship my code (macOS / Linux).
-
-Usage:
-  im-in-ur-computer.sh [-i] [-v] [-k keyword] [-d dir]... [extra dirs...]
-  curl -fsSL https://lijy91.github.io/im-in-ur-computer.sh | sh -s -- [options]
-
-  -k  keyword to look for in NOTICES (default: LiJianying)
-  -d  search only this dir instead of the defaults (repeatable)
-  -i  case-insensitive
-  -v  list the apps and packages
-  -h  show this help
-USAGE
+  printf '%s\n' \
+    "im in ur computer 👀" \
+    "Find apps on your machine that ship my code (macOS / Linux)." \
+    "" \
+    "Usage:" \
+    "  im-in-ur-computer.sh [-i] [-l] [-k keyword] [-d dir]... [extra dirs...]" \
+    "  curl -fsSL https://lijy91.github.io/im-in-ur-computer.sh | sh -s -- [options]" \
+    "" \
+    "  -k  keyword to look for in NOTICES (default: LiJianying)" \
+    "  -d  search only this dir instead of the defaults (repeatable)" \
+    "  -i  case-insensitive" \
+    "  -l  list the apps that depend on my code" \
+    "  -h  show this help"
 }
 
-while getopts "k:d:ivh" opt; do
+while getopts "k:d:ilh" opt; do
   case "$opt" in
     k) KEYWORD="$OPTARG" ;;
     i) ICASE=1 ;;
-    v) VERBOSE=1 ;;
+    l) LIST=1 ;;
     d) ONLY_DIRS="$ONLY_DIRS|$OPTARG" ;;
     h) usage; exit 0 ;;
     *) usage; exit 1 ;;
@@ -65,8 +65,43 @@ if [ -n "$ONLY_DIRS" ]; then
   DIRS_IM="${ONLY_DIRS#|}"
 fi
 
-TMP_LIST=$(mktemp "${TMPDIR:-/tmp}/im-in-ur-computer.XXXXXX") || exit 1
-trap 'rm -f "$TMP_LIST"' EXIT INT TERM
+# Spinner on stderr while working (only when stderr is a terminal).
+# Nothing is written to disk: status() restarts the spinner with a new message.
+SPIN=0
+[ -t 2 ] && SPIN=1
+SPIN_PID=""
+spin() {
+  while :; do
+    for f in ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏; do
+      printf '\r\033[K%s %s' "$f" "$1" >&2
+      sleep 0.1 2>/dev/null || sleep 1
+    done
+  done
+}
+kill_spin() {
+  if [ -n "$SPIN_PID" ]; then
+    kill "$SPIN_PID" 2>/dev/null
+    wait "$SPIN_PID" 2>/dev/null
+    SPIN_PID=""
+  fi
+}
+status() {
+  [ $SPIN -eq 1 ] || return 0
+  kill_spin
+  spin "$1" &
+  SPIN_PID=$!
+}
+stop_spin() {
+  [ $SPIN -eq 1 ] || return 0
+  kill_spin
+  SPIN=0
+  printf '\r\033[K\033[?25h' >&2
+}
+trap stop_spin EXIT
+trap 'stop_spin; exit 130' INT TERM
+
+[ $SPIN -eq 1 ] && printf '\033[?25l' >&2
+status "sneaking into ur apps..."
 
 # NOTICES.Z is gzip (zlib as fallback); plain NOTICES is printed as-is
 decompress() {
@@ -139,31 +174,46 @@ scan_dir() {
     -path '*flutter_assets/*' 2>/dev/null
 }
 
-{
+FOUND=$(
   for d in $DIRS; do scan_dir "$d"; done
   if [ -n "$DIRS_IM" ]; then
-    OLD_IFS=$IFS; IFS='|'
+    IFS='|'
     for d in $DIRS_IM; do scan_dir "$d"; done
-    IFS=$OLD_IFS
   fi
   for d in "$@"; do scan_dir "$d"; done
-} | sort -u > "$TMP_LIST"
+)
+FOUND=$(printf '%s\n' "$FOUND" | sort -u)
 
+count=$(printf '%s\n' "$FOUND" | grep -c .)
 total=0
 matched=0
 all_pkgs=""
-while IFS= read -r notices; do
+apps=""
+# Split on newlines only (paths may contain spaces), no globbing
+set -f
+OLD_IFS=$IFS
+IFS='
+'
+for notices in $FOUND; do
+  IFS=$OLD_IFS
   [ -n "$notices" ] || continue
   total=$((total + 1))
   name=$(app_name "$notices")
+  status "reading the fine print of $name ($total/$count)..."
 
   pkgs=$(decompress "$notices" | search_notices)
   if [ -n "$pkgs" ]; then
     matched=$((matched + 1))
     all_pkgs="$all_pkgs,$pkgs"
-    [ $VERBOSE -eq 1 ] && echo "  ✓ $name — $pkgs"
+    n=$(echo "$pkgs" | tr ',' '\n' | grep -c .)
+    apps="$apps$name|$n
+"
   fi
-done < "$TMP_LIST"
+done
+IFS=$OLD_IFS
+set +f
+
+stop_spin
 
 npkgs=$(echo "$all_pkgs" | tr ',' '\n' | sed 's/^ *//' | grep -v '^$' | sort -u | wc -l | tr -d ' ')
 
@@ -182,6 +232,12 @@ if [ $matched -gt 0 ]; then
   if [ $matched -eq 1 ]; then were="was"; they="it depends"; else were="were"; they="they depend"; fi
   echo "$(plural $matched app) here $were built by other ppl. $they on $(plural $npkgs package) i wrote."
   echo "${B}u never installed me. but here i am.${R}"
+  if [ $LIST -eq 1 ]; then
+    echo ""
+    printf '%s' "$apps" | sort -f | while IFS='|' read -r name n; do
+      echo "  · $name ${D}($(plural $n package))${R}"
+    done
+  fi
   echo ""
   echo "${D}not my apps. just my code, quietly doing its job inside ♥${R}"
 else
